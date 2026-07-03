@@ -16,11 +16,13 @@ class LLM:
         model: str = "gpt-4o-mini",
         temperature: float = 0.0,
         tools: Optional[List[Tool]] = None,
-        api_key: Optional[str] = None
+        api_key: Optional[str] = None,
+        timeout: float = 30.0,
     ):
         self.model = model
         self.temperature = temperature
-        self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
+        self.timeout = timeout
+        self.client = OpenAI(api_key=api_key, timeout=timeout) if api_key else OpenAI(timeout=timeout)
         self.tools: Dict[str, Tool] = {
             tool.name: tool for tool in (tools or [])
         }
