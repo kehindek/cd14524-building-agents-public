@@ -1,5 +1,8 @@
 import os
+import re
 import json
+import uuid
+import subprocess
 from types import SimpleNamespace
 from typing import List, Optional, Dict, Any
 from openai import OpenAI
@@ -11,6 +14,11 @@ from lib.messages import (
     UserMessage,
 )
 from lib.tooling import Tool
+
+_CLAUDE_EXE = os.path.join(
+    os.path.expanduser("~"),
+    r".vscode\extensions\anthropic.claude-code-2.1.200-win32-x64\resources\native-binary\claude.exe",
+)
 
 
 class LLM:
@@ -31,16 +39,24 @@ class LLM:
             tool.name: tool for tool in (tools or [])
         }
 
-        if self.provider not in {"openai", "anthropic", "claude"}:
+        if self.provider not in {"openai", "anthropic", "claude", "claude_code"}:
             raise ValueError(
-                "provider must be 'openai', 'anthropic', or 'claude'"
+                "provider must be 'openai', 'anthropic', 'claude', or 'claude_code'"
             )
 
+        if self.provider == "claude_code":
+            self.model = model or os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6")
+            self.client = None
+            return
+
+        auth_token = None
         if api_key is None:
             if self.provider == "openai":
                 api_key = os.getenv("OPENAI_API_KEY")
             else:
                 api_key = os.getenv("ANTHROPIC_API_KEY")
+                if api_key is None:
+                    auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
 
         if self.provider == "openai":
             self.model = model or "gpt-4o-mini"
@@ -48,11 +64,91 @@ class LLM:
                 base_url = os.getenv("OPENAI_BASE_URL")
             self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout) if api_key else OpenAI(base_url=base_url, timeout=timeout)
         else:
-            self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
-            self.client = Anthropic(api_key=api_key, timeout=timeout) if api_key else Anthropic(timeout=timeout)
+            self.model = model or os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+            if auth_token:
+                self.client = Anthropic(auth_token=auth_token, timeout=timeout)
+            elif api_key:
+                self.client = Anthropic(api_key=api_key, timeout=timeout)
+            else:
+                self.client = Anthropic(timeout=timeout)
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
+
+    # ── Claude Code CLI provider ──────────────────────────────────────────
+
+    def _cli_invoke(self, messages: List[BaseMessage]) -> AIMessage:
+        parts = []
+
+        if self.tools:
+            tool_lines = []
+            for t in self.tools.values():
+                fd = t.dict()["function"]
+                params = ", ".join(fd["parameters"]["properties"].keys())
+                desc = fd["description"].split("\n")[0]
+                tool_lines.append(f"  - {fd['name']}({params}): {desc}")
+            parts.append(
+                "You have access to these tools. When you need to call one, "
+                "output ONLY this on its own line (nothing else before or after):\n"
+                '<tool_call>{"name": "tool_name", "arguments": {"arg": "value"}}</tool_call>\n\n'
+                "Available tools:\n" + "\n".join(tool_lines)
+            )
+
+        for msg in messages:
+            role = getattr(msg, "role", "user")
+            content = msg.content or ""
+            if role == "system":
+                parts.insert(0, f"[System instructions: {content}]\n")
+            elif role == "user":
+                parts.append(f"Human: {content}")
+            elif role == "assistant":
+                if getattr(msg, "tool_calls", None):
+                    tc = msg.tool_calls[0]
+                    args = json.loads(tc.function.arguments)
+                    parts.append(
+                        f'Assistant: <tool_call>{{"name": "{tc.function.name}", "arguments": {json.dumps(args)}}}</tool_call>'
+                    )
+                else:
+                    parts.append(f"Assistant: {content}")
+            elif role == "tool":
+                parts.append(f"Tool result ({msg.name}): {content}\n\nNow give your final answer to the user.")
+
+        prompt = "\n".join(parts)
+
+        result = subprocess.run(
+            [_CLAUDE_EXE, "--print", "--output-format", "json", "--tools", "none", "--model", self.model],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout + 60,
+        )
+
+        try:
+            output = json.loads(result.stdout)
+            text = output.get("result", "")
+        except json.JSONDecodeError:
+            text = result.stdout.strip()
+
+        match = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+        if match and self.tools:
+            try:
+                tc_data = json.loads(match.group(1))
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
+                tool_call = SimpleNamespace(
+                    id=call_id,
+                    type="function",
+                    function=SimpleNamespace(
+                        name=tc_data["name"],
+                        arguments=json.dumps(tc_data["arguments"]),
+                    ),
+                )
+                return AIMessage(content=None, tool_calls=[tool_call])
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        return AIMessage(content=text)
+
+    # ── Standard SDK providers ────────────────────────────────────────────
 
     def _build_payload(self, messages: List[BaseMessage]) -> Dict[str, Any]:
         if self.provider == "openai":
@@ -165,6 +261,10 @@ class LLM:
 
     def invoke(self, input: str | BaseMessage | List[BaseMessage]) -> AIMessage:
         messages = self._convert_input(input)
+
+        if self.provider == "claude_code":
+            return self._cli_invoke(messages)
+
         payload = self._build_payload(messages)
 
         if self.provider == "openai":
